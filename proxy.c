@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "csapp.h"
+#include "url_parser.h"
 // Sequential -> cocurrent ->
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
@@ -10,10 +11,11 @@ static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64;
 static const char *conn_hdr = "Connection: close\r\n";
 static const char *proxy_conn_hdr = "Proxy-Connection: close\r\n";
 int transmit(int connfd);
-int parse_request_line(int fd, char *request_line, char *buf, char *host, char *abs_path);
 void clienterror(int fd, char *cause, char *errnum,
                  char *shortmsg, char *longmsg);
-int parse_request(int contfd, char *request_buf, char *url);
+int parse_request(int contfd, char *request_buf, char *host, char *port);
+int parse_request_line(rio_t *client_rp, char *parsed_request,
+                       char *host, char *port, char *uri);
 
 int main(int argc, char **argv)
 {
@@ -21,23 +23,45 @@ int main(int argc, char **argv)
     socklen_t clientlen;
     struct sockaddr_in clientaddr;
     char request_buf[MAX_OBJECT_SIZE];
-    char url[MAXLINE];
-
+    char host[MAXLINE];
+    char port[MAXLINE];
+    size_t receive_size;
     listenfd = Open_listenfd(PORT);
     while (1)
     {
+        int proxy_client_fd;
         clientlen = sizeof(clientaddr);
         // 接收client发来的链接
         connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
         printf("connected to %d\n", clientaddr.sin_addr.s_addr);
-        /* determine the domain name and IP address of the client */
-        // 处理client发来的链接
-        if (parse_request(connfd, request_buf, url) != -1)
+
+        // 处理client发来的链接, 将处理好的内容放在request_buf中
+        if (parse_request(connfd, request_buf, host, port) == -1)
         {
-            printf("here");
-            printf(request_buf);
-            Rio_writen(connfd, request_buf, strlen(request_buf));
+            Close(connfd);
+            continue;
         }
+
+        printf("received msg from client:\n");
+        printf(request_buf);
+
+        // 向对向服务器发送信息
+        if ((proxy_client_fd = Open_clientfd(host, port)) < 0)
+        {
+            continue;
+        };
+
+        Rio_writen(proxy_client_fd, request_buf, strlen(request_buf));
+        receive_size = Rio_readn(proxy_client_fd, request_buf, MAX_OBJECT_SIZE);
+        close(proxy_client_fd);
+
+        printf("received msg from server:\n");
+        Rio_writen(STDOUT_FILENO, request_buf, receive_size);
+
+        //将服务器内容发送给client
+        Rio_writen(connfd, request_buf, receive_size);
+
+        // 将处理好的内容转发给目标host
         Close(connfd);
         printf("connection is closed\n");
     }
@@ -48,25 +72,25 @@ int main(int argc, char **argv)
  * parse_request - parse the whole request
  * return -1 if message format is not correct or exceed maximum object size limit
  */
-int parse_request(int contfd, char *request_buf, char *url)
+int parse_request(int contfd, char *request_buf, char *host, char *port)
 {
     char buf[MAXLINE];
     char parsed_request_line[MAXLINE];
     char header_field[MAXLINE];
     char header_field_value[MAXLINE];
-    char host[MAXLINE];
     char abs_path[MAXLINE];
     rio_t rio;
-    int is_host_header_present = 0; // Host header是否在request message中的header出现过
 
     Rio_readinitb(&rio, contfd);
-    Rio_readlineb(&rio, buf, MAX_OBJECT_SIZE);
+
     /* parse request line */
-    if (parse_request_line(contfd, buf, parsed_request_line, host, abs_path) == -1)
+    if (parse_request_line(&rio, parsed_request_line, host, port, abs_path) == -1)
     {
         return -1;
-    };
+    }
+    printf("request line:\n");
     snprintf(request_buf, MAX_OBJECT_SIZE, "%s", parsed_request_line);
+
     int host_hdr_exist = 0, conn_hdr_exist = 0, proxy_conn_hdr_exist = 0;
     while (1)
     {
@@ -111,46 +135,6 @@ int parse_request(int contfd, char *request_buf, char *url)
         strcat(request_buf, proxy_conn_hdr);
     }
     strcat(request_buf, "\r\n");
-#ifdef MY
-    /* Add the default value for crutial header fields */
-    snprintf(request_buf, MAX_OBJECT_SIZE, "%s", parsed_request_line);
-    snprintf(request_buf, MAX_OBJECT_SIZE, "%sUser-Agent: %s\r\n", request_buf, user_agent_hdr);
-    snprintf(request_buf, MAX_OBJECT_SIZE, "%sConnection: close\r\n", request_buf);
-    snprintf(request_buf, MAX_OBJECT_SIZE, "%sProxy-Connection: close\r\n", request_buf);
-    /* Start to read the whole header fields*/
-    Rio_readlineb(&rio, buf, MAXLINE);
-    while (strcmp(buf, "\r\n"))
-    {
-        // 如果是这几种已经设置好的header fields，就直接跳过
-        if (
-            strstr(buf, "User-Agent") ||
-            strstr(buf, "Connection") ||
-            strstr(buf, "Proxy-Connection"))
-        {
-            continue;
-        }
-
-        // 如果是Host，那么直接使用request header中的Host字段
-        if (strstr(buf, "Host"))
-        {
-            is_host_header_present = 1;
-        }
-        snprintf(request_buf, MAX_OBJECT_SIZE, "%s%s", request_buf, buf);
-        Rio_readlineb(&rio, buf, MAXLINE);
-    }
-
-    // 没有Host字段，使用从url中获取的host字段
-    if (!is_host_header_present)
-    {
-        snprintf(request_buf, MAX_OBJECT_SIZE, "%sHost: %s\r\n", request_buf, host);
-    }
-    // // 将剩下entity body部分写入, 并且检查是否超过buffer的size
-    if (snprintf(request_buf, MAX_OBJECT_SIZE, "%s%s", request_buf, buf) >= MAX_OBJECT_SIZE)
-        snprintf(request_buf, MAX_OBJECT_SIZE, "\r\n");
-        // Rio_readnb(&rio, buf, MAX_OBJECT_SIZE);
-        // if (snprintf(request_buf, MAX_OBJECT_SIZE, "%s%s", request_buf, buf) >= MAX_OBJECT_SIZE)
-        //     return -1;
-#endif
     return 0;
 }
 
@@ -158,11 +142,53 @@ int parse_request(int contfd, char *request_buf, char *url)
  * parse_request_line - taking a request line and parse properly
  * fd is connection file descriptor used to transform error handling page
  */
+int parse_request_line(rio_t *client_rp, char *parsed_request,
+                       char *host, char *port, char *uri)
+{
+    char request_line[MAXLINE];
+    char method[MAXLINE], url[MAXLINE], version[MAXLINE];
+
+    if (!Rio_readlineb(client_rp, request_line, MAXLINE))
+        return -1;
+
+    sscanf(request_line, "%s %s %s", method, url, version);
+
+    // Check request method
+    if (strcasecmp(method, "GET"))
+    {
+        clienterror(client_rp->rio_fd, method, "501", "Not Implemented",
+                    "The proxy does not implement this method");
+        return -1;
+    }
+
+    URL_INFO info;
+    split_url(&info, url);
+    strcpy(host, info.host);
+    strcpy(port, info.port);
+    strcpy(uri, info.path);
+
+    // Check HTTP version
+    if (strcmp("HTTP/1.0", version) && strcmp("HTTP/1.1", version))
+    {
+        clienterror(client_rp->rio_fd, method, "400", "Bad request",
+                    "Invalid HTTP version");
+        return -1;
+    }
+    else
+    {
+        strcpy(version, "HTTP/1.0");
+    }
+
+    sprintf(parsed_request, "%s %s %s\r\n", method, uri, version);
+    return 0;
+}
+
+#ifdef MY
 int parse_request_line(int fd, char *request_line, char *buf, char *host, char *abs_path)
 
 {
     char method[MAXLINE];
-    if (sscanf(request_line, "%s http://%[a-zA-Z.]/%s HTTP", method, host, abs_path) != 3)
+    if (sscanf(request_line, "%s http://%[a-zA-Z.]/%s HTTP", method, host, abs_path) < 2)
     {
         clienterror(fd, method, "501", "Not Implemented",
                     "HTTP request is illegal");
@@ -179,6 +205,7 @@ int parse_request_line(int fd, char *request_line, char *buf, char *host, char *
 
     return 0;
 }
+#endif
 
 /*
  * clienterror - returns an error message to the client

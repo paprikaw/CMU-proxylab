@@ -10,14 +10,17 @@ LDFLAGS = -lpthread
 
 all: proxy
 
+url_parser.o: url_parser.c url_parser.h
+	$(CC) $(CFLAGS) -c url_parser.c
+
 csapp.o: csapp.c csapp.h
 	$(CC) $(CFLAGS) -c csapp.c
 
-proxy.o: proxy.c csapp.h
+proxy.o: proxy.c csapp.h url_parser.h
 	$(CC) $(CFLAGS) -c proxy.c
 
-proxy: proxy.o csapp.o
-	$(CC) $(CFLAGS) proxy.o csapp.o -o proxy $(LDFLAGS)
+proxy: proxy.o csapp.o url_parser.o
+	$(CC) $(CFLAGS) proxy.o csapp.o url_parser.o -o proxy $(LDFLAGS)
 
 # Creates a tarball in ../proxylab-handin.tar that you can then
 # hand in. DO NOT MODIFY THIS!
