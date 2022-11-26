@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include "csapp.h"
 #include "url_parser.h"
+#include "sbuf.h"
 // Sequential -> cocurrent ->
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
-#define PORT "38888"
+#define NTHREADS 4
+#define SBUFSIZE 16
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
 static const char *conn_hdr = "Connection: close\r\n";
@@ -16,24 +18,44 @@ void clienterror(int fd, char *cause, char *errnum,
 int parse_request(int contfd, char *request_buf, char *host, char *port);
 int parse_request_line(rio_t *client_rp, char *parsed_request,
                        char *host, char *port, char *uri);
+void *thread(void *vargp);
 
+sbuf_t sbuf; /* shared buffer of connected descriptors */
 int main(int argc, char **argv)
 {
     int listenfd, connfd;
     socklen_t clientlen;
-    struct sockaddr_in clientaddr;
+    listenfd = Open_listenfd(argv[1]);
+    sbuf_init(&sbuf, SBUFSIZE);
+    pthread_t tid;
+
+    for (int i = 0; i < NTHREADS; i++) /* Create worker threads */ // line:conc:pre:begincreate
+        Pthread_create(&tid, NULL, thread, NULL);                  // line:conc:pre:endcreate
+    while (1)
+    {
+        struct sockaddr_in clientaddr;
+        clientlen = sizeof(clientaddr);
+        // 接收client发来的链接
+        connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        sbuf_insert(&sbuf, connfd); /* Insert connfd in buffer */
+        printf("connected to %d\n", clientaddr.sin_addr.s_addr);
+    }
+    exit(0);
+}
+
+void *thread(void *vargp)
+{
+    Pthread_detach(pthread_self());
     char request_buf[MAX_OBJECT_SIZE];
     char host[MAXLINE];
     char port[MAXLINE];
     size_t receive_size;
-    listenfd = Open_listenfd(PORT);
+    int proxy_client_fd;
+    int connfd;
+
     while (1)
     {
-        int proxy_client_fd;
-        clientlen = sizeof(clientaddr);
-        // 接收client发来的链接
-        connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
-        printf("connected to %d\n", clientaddr.sin_addr.s_addr);
+        connfd = sbuf_remove(&sbuf); /* Remove connfd from buffer */ // line:conc:pre:removeconnfd
 
         // 处理client发来的链接, 将处理好的内容放在request_buf中
         if (parse_request(connfd, request_buf, host, port) == -1)
@@ -65,9 +87,7 @@ int main(int argc, char **argv)
         Close(connfd);
         printf("connection is closed\n");
     }
-    exit(0);
 }
-
 /*
  * parse_request - parse the whole request
  * return -1 if message format is not correct or exceed maximum object size limit
@@ -182,30 +202,6 @@ int parse_request_line(rio_t *client_rp, char *parsed_request,
     sprintf(parsed_request, "%s %s %s\r\n", method, uri, version);
     return 0;
 }
-
-#ifdef MY
-int parse_request_line(int fd, char *request_line, char *buf, char *host, char *abs_path)
-
-{
-    char method[MAXLINE];
-    if (sscanf(request_line, "%s http://%[a-zA-Z.]/%s HTTP", method, host, abs_path) < 2)
-    {
-        clienterror(fd, method, "501", "Not Implemented",
-                    "HTTP request is illegal");
-        return -1;
-    }
-
-    if (strcmp(method, "GET"))
-    {
-        clienterror(fd, method, "501", "Not Implemented",
-                    "Tiny does not implement this method");
-        return -1;
-    }
-    sprintf(buf, "%s /%s %s\r\n", method, abs_path, "HTTP/1.0");
-
-    return 0;
-}
-#endif
 
 /*
  * clienterror - returns an error message to the client
