@@ -1,6 +1,9 @@
 {
     "files.associations": {
         "csapp.h": "c",
-        "sbuf.h": "c"
-    }
+        "sbuf.h": "c",
+        "semaphore.h": "c",
+        "stdarg.h": "c"
+    },
+    "C_Cpp.default.configurationProvider": "ms-vscode.makefile-tools"
 }

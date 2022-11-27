@@ -2,31 +2,44 @@
 #include "csapp.h"
 #include "url_parser.h"
 #include "sbuf.h"
+#include "cache.h"
 // Sequential -> cocurrent ->
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
 #define NTHREADS 4
 #define SBUFSIZE 16
+#define CACHESIZE 16
+
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
 static const char *conn_hdr = "Connection: close\r\n";
 static const char *proxy_conn_hdr = "Proxy-Connection: close\r\n";
-int transmit(int connfd);
 void clienterror(int fd, char *cause, char *errnum,
                  char *shortmsg, char *longmsg);
-int parse_request(int contfd, char *request_buf, char *host, char *port);
+int parse_request(int contfd, char *request_buf, char *host, char *port, char *url);
 int parse_request_line(rio_t *client_rp, char *parsed_request,
-                       char *host, char *port, char *uri);
+                       char *host, char *port, char *uri, char *url);
 void *thread(void *vargp);
 
-sbuf_t sbuf; /* shared buffer of connected descriptors */
+sbuf_t sbuf;          /* shared buffer of connected descriptors */
+cache_t shared_cache; /* shared cache for all worker */
+
+/* globol variable for reader-writer modal */
+int readcnt;    /* Initially = 0 */
+sem_t mutex, w; /* Both initially = 1 */
+
 int main(int argc, char **argv)
 {
     int listenfd, connfd;
     socklen_t clientlen;
     listenfd = Open_listenfd(argv[1]);
     sbuf_init(&sbuf, SBUFSIZE);
+    init_cache(CACHESIZE, &shared_cache);
+    /* Initialize semaphore*/
+    Sem_init(&mutex, 0, 1);
+    Sem_init(&w, 0, 1);
+
     pthread_t tid;
 
     for (int i = 0; i < NTHREADS; i++) /* Create worker threads */ // line:conc:pre:begincreate
@@ -43,22 +56,30 @@ int main(int argc, char **argv)
     exit(0);
 }
 
+/*
+ * thread - single thread routine, handle connections
+ * return -1 if message format is not correct or exceed maximum object size limit
+ */
 void *thread(void *vargp)
 {
     Pthread_detach(pthread_self());
     char request_buf[MAX_OBJECT_SIZE];
+    char response[MAX_OBJECT_SIZE];
     char host[MAXLINE];
     char port[MAXLINE];
+    char url[MAXLINE];
     size_t receive_size;
+    size_t cache_res_buf_size;
     int proxy_client_fd;
     int connfd;
+    cache_node_t *cache_res = NULL;
 
     while (1)
     {
         connfd = sbuf_remove(&sbuf); /* Remove connfd from buffer */ // line:conc:pre:removeconnfd
 
         // 处理client发来的链接, 将处理好的内容放在request_buf中
-        if (parse_request(connfd, request_buf, host, port) == -1)
+        if (parse_request(connfd, request_buf, host, port, url) == -1)
         {
             Close(connfd);
             continue;
@@ -66,6 +87,46 @@ void *thread(void *vargp)
 
         printf("received msg from client:\n");
         printf(request_buf);
+
+        /* reader setup semaphore*/
+        P(&mutex);
+        readcnt++;
+        if (readcnt == 1)
+        {
+            P(&w);
+        }
+        V(&mutex);
+
+        cache_res = lookup_cache(&shared_cache, url);
+
+        if (cache_res != NULL)
+        {
+            memcpy(request_buf, cache_res->buf, cache_res->buf_size);
+            cache_res_buf_size = cache_res->buf_size;
+            /* reader finish semaphore*/
+            P(&mutex);
+            readcnt--;
+            if (readcnt == 0)
+            {
+                V(&w);
+            }
+            V(&mutex);
+
+            //将服务器内容发送给client
+            Rio_writen(connfd, request_buf, cache_res_buf_size);
+
+            // 将处理好的内容转发给目标host
+            Close(connfd);
+            continue;
+        }
+        /* reader finish semaphore*/
+        P(&mutex);
+        readcnt--;
+        if (readcnt == 0)
+        {
+            V(&w);
+        }
+        V(&mutex);
 
         // 向对向服务器发送信息
         if ((proxy_client_fd = Open_clientfd(host, port)) < 0)
@@ -76,6 +137,11 @@ void *thread(void *vargp)
         Rio_writen(proxy_client_fd, request_buf, strlen(request_buf));
         receive_size = Rio_readn(proxy_client_fd, request_buf, MAX_OBJECT_SIZE);
         close(proxy_client_fd);
+
+        /* 将收到的message存到cache中 */
+        P(&w);
+        insert_cache(&shared_cache, request_buf, receive_size);
+        V(&w);
 
         printf("received msg from server:\n");
         Rio_writen(STDOUT_FILENO, request_buf, receive_size);
@@ -92,7 +158,7 @@ void *thread(void *vargp)
  * parse_request - parse the whole request
  * return -1 if message format is not correct or exceed maximum object size limit
  */
-int parse_request(int contfd, char *request_buf, char *host, char *port)
+int parse_request(int contfd, char *request_buf, char *host, char *port, char *url)
 {
     char buf[MAXLINE];
     char parsed_request_line[MAXLINE];
@@ -104,7 +170,7 @@ int parse_request(int contfd, char *request_buf, char *host, char *port)
     Rio_readinitb(&rio, contfd);
 
     /* parse request line */
-    if (parse_request_line(&rio, parsed_request_line, host, port, abs_path) == -1)
+    if (parse_request_line(&rio, parsed_request_line, host, port, abs_path, url) == -1)
     {
         return -1;
     }
@@ -163,10 +229,10 @@ int parse_request(int contfd, char *request_buf, char *host, char *port)
  * fd is connection file descriptor used to transform error handling page
  */
 int parse_request_line(rio_t *client_rp, char *parsed_request,
-                       char *host, char *port, char *uri)
+                       char *host, char *port, char *uri, char *url)
 {
     char request_line[MAXLINE];
-    char method[MAXLINE], url[MAXLINE], version[MAXLINE];
+    char method[MAXLINE], version[MAXLINE];
 
     if (!Rio_readlineb(client_rp, request_line, MAXLINE))
         return -1;
